@@ -36,30 +36,34 @@ options.view_as(StandardOptions).runner = args.runner
 #    projectId="pascalwhoop", datasetId="phone_sensors", tableId="heartbeat"
 #)
 sink_table_spec = bigquery.TableReference(
-    projectId="bitcoin-data-analysis-320014", datasetId="transaction_analysis", tableId="txs_two_or_less_outputs"
+    projectId="bitcoin-data-analysis-320014", datasetId="transaction_analysis", tableId="txs_two_or_less_outputs_tmp"
 )
 
 def make_sink_schema():
     mapping = {
-        "tx_hash":          "STRING", 
+        "tx_hash":         "STRING", 
         "block_timestamp": "TIMESTAMP", 
-        "block_number": "INTEGER", 
-        "input_count": "INTEGER",
-        "output_count": "INTEGER", 
-        "input_type": "STRING",
-        "output_type": "STRING",
-        "input_value": "INTEGER", 
-        "output_value": "INTEGER", 
-        "payment_value": "INTEGER",
-        "change_value": "INTEGER",
-        "mining_fee": "INTEGER",
-        "mining_fee_rate": "FLOAT"
+        "block_number":    "INTEGER", 
+        "input_count":     "INTEGER",
+        "output_count":    "INTEGER", 
+        "input_type":      "STRING",
+        "output_type":     "STRING",
+        "input_value":     "INTEGER", 
+        "output_value":    "INTEGER",
+        "heuristic":       "STRING",
+        "payment_value":   "INTEGER",
+        "change_value":    "INTEGER",
+        "mining_fee":      "INTEGER",
+        "mining_fee_rate": "FLOAT",
+        "payment_usd":     "FLOAT",
+        "change_usd":      "FLOAT",
+        "fee_usd":         "FLOAT",
     }
     mapping_list =  [{"mode": "NULLABLE", "name": k, "type": mapping[k]} for k in mapping.keys()]
     return json.JSONEncoder(sort_keys=True).encode({"fields": mapping_list})
 
 table_schema = parse_table_schema_from_json(make_sink_schema())
-
+additional_bq_parameters = {'timePartitioning': {'type': 'DAY', 'field': 'block_timestamp'}}
 source = ReadFromBigQuery(query=f"""
         SELECT `hash` as tx_hash
              , block_timestamp
@@ -75,11 +79,11 @@ source = ReadFromBigQuery(query=f"""
           FROM `bigquery-public-data.crypto_bitcoin.transactions`
          WHERE TRUE
            AND is_coinbase IS FALSE
-           AND date(block_timestamp) BETWEEN '{args.start_date}' AND '{args.end_date}'
+           AND block_timestamp_month BETWEEN '{args.start_date}' AND '{args.end_date}'
            AND output_count < 3
         """, use_standard_sql=True)  # you can also use SQL queries
 # source = BigQuerySource(source_table_spec)
-target = WriteToBigQuery(sink_table_spec, schema=table_schema)
+target = WriteToBigQuery(sink_table_spec, schema=table_schema, additional_bq_parameters=additional_bq_parameters,)
 
 
 def run():
@@ -108,11 +112,13 @@ class ElementCleanup(beam.DoFn):
         tx_type = {
         'witness_v0_keyhash': 0,
         'witness_v0_scripthash': 0,
+        'witness_v1_taproot': 0,
+        'witness_unknown': 0,
         'pubkeyhash': 0,
         'scripthash': 0,
         'nonstandard': 0,
         'multisig': 0,
-        'pubkey':0,
+        'pubkey': 0,
         }
         # verify inputs are all the same
         for tx_input in row['inputs']:
@@ -147,23 +153,32 @@ class ElementCleanup(beam.DoFn):
         # if there is only one input and one output, there cannot be a change address
         # unlikely that these are actual payments but we are keeping them in the dataset
         # for now. they might yield something interesting when studied on their own
-        if row['input_count'] == 1 and row['output_count'] == 1:
+        if row['output_count'] == 1:
             row['change_value'] = 0
+            row['heuristic'] = 'single_output'
 
         # for nonstandard outputs, choose the output which is not non-standard as the
         # payment value.
-        # these also are unlikely to be regular payments, excluding for now
+        # these also are unlikely to be regular payments, but keeping them in for now
+        # it is advised users filter them out when querying the underlying table
         elif row['output_type'] == 'nonstandard':
             for output in row['outputs']:
                 if output['type'] != 'nonstandard':
                     row['change_value'] = 0
+                    row['heuristic'] = 'nonstandard'
 
-        # for mixed outputs, we want to pick the output that is the same as the inputs as
-        # the change address. this is generally, not always, true
-        elif row['output_type'] == 'mixed_outputs' and row['output_count'] > 1:
+        # for txs with multiple outputs, first check for address reuse
+        # the reused address is most likely the change address
+        elif row['output_count'] > 1:
             for output in row['outputs']:
-                if output['type'] == row['input_type']:
-                    row['change_value'] = output['value']
+                for inputs in row['inputs']:
+                    if inputs['addresses'][0] == output['addresses'][0]:
+                        row['change_value'] = output['value']
+                        row['heuristic'] = 'address_reuse'
+                    elif row['output_type'] == 'mixed_outputs' and row['input_type'] == output['type']:
+                        row['change_value'] = output['value']
+                        row['heuristic'] = 'matching_address_type'
+        
         # if we have multiple inputs and two outputs, the change value should be the output which
         # is less than or equal to the minimum of the inputs
         elif row['output_count'] > 1 and row['input_count'] > 1:
@@ -172,19 +187,13 @@ class ElementCleanup(beam.DoFn):
             if len(change_value) == 1:
                 # what about when it's more??
                 row['change_value'] = change_value[0]['value']
+                row['heuristic'] = 'less_than_minimum_input'
             elif len(change_value) > 1:
                 min_input = min(row['inputs'], key=lambda x: x['value'])['value'] - row['mining_fee']
                 change_value = list(filter(lambda x: x['value'] <= min_input, row['outputs']))
-        # if there are many inputs to one output, there is no change address
-        # difficult to say if these are payments or not. its possible this is UTXO consolidation by
-        # a user, but it could also be a wallets that are optimizing for shrinking the UTXO set by combining
-        # inputs into exactly one output
-        elif row['input_count'] > 1 and row['output_count'] == 1:
-            row['change_value'] = 0
-        elif row['input_count'] == 1:
-            for output in row['outputs']:
-                if output['addresses'][0] == row['inputs'][0]['addresses'][0]:
-                    row['change_value'] = output['value']
+                row['change_value'] = change_value[0]['value']
+                row['heuristic'] = 'less_than_minimum_input'
+        
         # only calculate a change and payment value if we have something for change,
         # even if it is zero. if we have nothing, both change and payment will be null
         # which means we weren't able to make an educated guess
