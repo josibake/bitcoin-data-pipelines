@@ -24,7 +24,7 @@ args = parser.parse_args()
 options = PipelineOptions()
 google_cloud_options = options.view_as(GoogleCloudOptions)
 google_cloud_options.project = "bitcoin-data-analysis-320014"
-google_cloud_options.job_name = "parse-bitcoin-transactions"
+google_cloud_options.job_name = "parse-bitcoin-transactions-2009-2013"
 google_cloud_options.region = "us-east1"
 google_cloud_options.staging_location = "gs://josibake-testing/staging"
 google_cloud_options.temp_location = "gs://josibake-testing/temp"
@@ -36,7 +36,7 @@ options.view_as(StandardOptions).runner = args.runner
 #    projectId="pascalwhoop", datasetId="phone_sensors", tableId="heartbeat"
 #)
 sink_table_spec = bigquery.TableReference(
-    projectId="bitcoin-data-analysis-320014", datasetId="transaction_analysis", tableId="txs_two_or_less_outputs_tmp"
+    projectId="bitcoin-data-analysis-320014", datasetId="transaction_analysis", tableId="txs_two_or_less_outputs"
 )
 
 def make_sink_schema():
